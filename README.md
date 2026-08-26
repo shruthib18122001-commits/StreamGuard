@@ -12,7 +12,7 @@ baked-in CUDA arch flags) for a possible later port to Jetson Orin Nano.
 
 ## Status
 
-Stage 1 of 6 (skeleton, config, metrics, mock inference backend). See
+Stage 2 of 6 (single-stream end-to-end, real latency instrumentation). See
 [Build order](#build-order) below for what's next.
 
 ## Architecture
@@ -76,6 +76,49 @@ Source -> NVDEC decode -> GPU preprocess -> batch -> TensorRT -> postprocess -> 
   queue/batching engine and the SLA controller be built and unit-tested on
   CPU, with no GPU, before any TensorRT integration exists.
 
+## What exists today (stage 2 additions)
+
+- **`streamguard/decode/`** — `Decoder` ABC + `CPUDecoder` (OpenCV
+  `VideoCapture`). Real decode, testable locally. `NVDECDecoder` is
+  deliberately not written yet — there's no NVIDIA driver on this dev
+  machine to verify a binding against, and unlike TensorRT (unavoidable,
+  landing stage 4 regardless), GPU-vs-CPU decode is an *experiment* to run
+  later, not a stage-2 requirement. It arrives once we're actually on Colab
+  and can pick a library against real hardware instead of guessing blind.
+
+- **`streamguard/preprocess/`** — `Preprocessor` ABC + `CPUPreprocessor`:
+  standard YOLOX-style letterbox resize (aspect-preserving, gray-114 pad —
+  a training-convention value, not arbitrary). Returns `PreprocessMeta`
+  (scale + pad) alongside the resized frame so postprocessing can map boxes
+  back to the original frame's coordinates. Output stays `(H, W, C)` to
+  match `InferenceBackend.infer`'s documented batch shape — no premature
+  NCHW/normalization conversion; that's a specific TensorRT engine's input
+  contract, decided in stage 4, not a general preprocessing concern.
+
+- **`streamguard/postprocess.py`** — `Postprocessor`: confidence
+  thresholding, vectorized greedy NMS, then inverts the letterbox transform
+  back to original-frame coordinates. This is real, tested logic (not
+  mocked) — it doesn't care whether the boxes it receives came from the
+  mock backend or a real TensorRT engine.
+
+- **`streamguard/metrics/timer.py`** — `Timer` ABC + `WallClockTimer`
+  (`time.perf_counter`, used via a `with` block around each stage).
+  Legitimate for CPU-only stages: the CUDA-events-not-`time.time()` rule
+  exists specifically because host timing only captures async GPU kernel
+  *submission*, not completion — there's no async GPU kernel here yet to be
+  fooled by. A `CudaEventTimer` implementing the same context-manager
+  contract lands once a stage actually submits GPU work (stage 4
+  inference, or NVDEC/CuPy once running on Colab); the pipeline code that
+  does `with timer:` won't need to change, only which `Timer` it's given.
+
+- **`streamguard/pipeline.py`** — `SingleStreamPipeline`: wires decode →
+  preprocess → infer → postprocess into one sequential loop for a single
+  stream, feeding every frame's per-stage timing into stage 1's
+  `LatencyTracker`. No queues, no threads, no batching across streams, no
+  SLA controller yet — those are stages 3 and 5. This stage exists purely
+  to get the interfaces and instrumentation right on the simplest possible
+  case before concurrency is layered on top.
+
 ## Degradation ladder (config-defined, controller lands in stage 5)
 
 | Level | Model      | Precision | Size | Frame skip |
@@ -90,7 +133,7 @@ Source -> NVDEC decode -> GPU preprocess -> batch -> TensorRT -> postprocess -> 
 ## Build order
 
 1. ✅ Skeleton, config system, metrics collection, mock inference backend
-2. Single-stream end-to-end with real latency instrumentation
+2. ✅ Single-stream end-to-end with real latency instrumentation
 3. Multi-stream: bounded queues, dynamic batching
 4. TensorRT integration, precision variants, engine build scripts
 5. SLA controller: degradation ladder + hysteresis

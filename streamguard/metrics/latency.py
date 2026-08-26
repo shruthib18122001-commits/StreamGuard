@@ -76,6 +76,10 @@ class LatencyTracker:
         return self._seen > self.warmup_samples
 
     @property
+    def samples(self) -> List[FrameLatency]:
+        return list(self._window)
+
+    @property
     def count(self) -> int:
         return len(self._window)
 
