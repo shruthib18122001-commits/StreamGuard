@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Never commit model weights, engines, video, or result data
+*.pt
+*.pth
+*.onnx
+*.weights
+*.engine
+*.trt
+*.mp4
+*.avi
+*.mov
+*.mkv
+data/videos/
+results/
+*.csv
+
+# Colab / notebooks scratch
+.ipynb_checkpoints/

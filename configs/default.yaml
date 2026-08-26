@@ -1,0 +1,23 @@
+# StreamGuard default config.
+# device: no hardcoded x86/Jetson assumptions — "cuda:0" resolves at runtime
+# to whatever GPU is present (Colab T4 today, Jetson Orin Nano later).
+device: cuda:0
+
+streams:
+  count: 4
+  sources: null  # null => synthetic/mock sources for local dev without real video
+
+model:
+  tier: m
+  precision: fp16
+  input_size: 640
+  weights_path: null
+
+sla:
+  deadline_ms: 33.0            # 30fps end-to-end budget
+  degrade_threshold_ms: 30.0    # p99 above this for min_dwell_time_s -> drop a rung
+  recover_threshold_ms: 20.0    # p99 below this for min_dwell_time_s -> climb back up
+  min_dwell_time_s: 2.0         # hysteresis: minimum time spent at a tier before switching again
+  window_size: 200              # rolling window size (frames) for percentile calc
+  warmup_samples: 30            # discarded before entering the rolling window
+  # ladder omitted -> falls back to DEFAULT_LADDER in streamguard/config.py
