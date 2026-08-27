@@ -40,6 +40,7 @@ class DecodedFrame:
     stream_id: int
     frame: np.ndarray
     decode_ms: float
+    frame_start: float  # perf_counter() at decode start -- see PostprocessWorker
 
 
 @dataclass
@@ -49,6 +50,7 @@ class PreprocessedItem:
     meta: PreprocessMeta
     decode_ms: float
     preprocess_ms: float
+    frame_start: float
 
 
 @dataclass
@@ -59,6 +61,7 @@ class InferredItem:
     decode_ms: float
     preprocess_ms: float
     inference_ms: float
+    frame_start: float
     tier: int = 0
 
 
@@ -124,13 +127,16 @@ class DecodeWorker(_SafeThread):
             while not self.stop_event.is_set():
                 if self.max_frames is not None and self.frames_read >= self.max_frames:
                     break
+                frame_start = time.perf_counter()
                 with WallClockTimer() as t:
                     frame = decoder.read_frame()
                 if frame is None:
                     break
                 try:
                     self.output_queue.put(
-                        DecodedFrame(stream_id=self.stream_id, frame=frame, decode_ms=t.elapsed_ms)
+                        DecodedFrame(
+                            stream_id=self.stream_id, frame=frame, decode_ms=t.elapsed_ms, frame_start=frame_start
+                        )
                     )
                 except QueueClosedError:
                     break
@@ -176,6 +182,7 @@ class PreprocessWorker(_SafeThread):
                             meta=meta,
                             decode_ms=item.decode_ms,
                             preprocess_ms=t.elapsed_ms,
+                            frame_start=item.frame_start,
                         )
                     )
                 except QueueClosedError:
@@ -274,6 +281,7 @@ class BatchInferenceWorker(_SafeThread):
                         decode_ms=item.decode_ms,
                         preprocess_ms=item.preprocess_ms,
                         inference_ms=t_infer.elapsed_ms,
+                        frame_start=item.frame_start,
                         tier=tier,
                     )
                 )
@@ -302,7 +310,15 @@ class PostprocessWorker(_SafeThread):
                 break
             with WallClockTimer() as t:
                 self.postprocessor.process(item.detections, item.meta)
-            total_ms = item.decode_ms + item.preprocess_ms + item.inference_ms + t.elapsed_ms
+            # True wall-clock elapsed since decode started, NOT the sum of
+            # the four stage durations: with real concurrency, a frame can
+            # sit in a bounded queue waiting for its turn (e.g. behind a
+            # backlog at the batcher) between stages, and that wait is
+            # genuinely part of what the SLA controller needs to see. Sum-
+            # of-stages only equals this in the queue-free single-stream
+            # pipeline; here it would silently under-report latency under
+            # exactly the load conditions the controller exists to catch.
+            total_ms = (time.perf_counter() - item.frame_start) * 1000.0
             self.tracker.record(
                 FrameLatency(
                     decode_ms=item.decode_ms,

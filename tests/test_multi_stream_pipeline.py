@@ -220,3 +220,31 @@ def test_sla_controller_degrades_and_reloads_model_across_threads(tmp_path):
     # happened, not just that FrameLatency.tier was set independently.
     assert backend.current_config["tier"] == ModelTier.NANO
     assert backend.current_config["precision"] == Precision.INT8
+
+
+def test_total_ms_reflects_queueing_delay_not_just_stage_sum(tmp_path):
+    # One stream, one-frame batches, a single inference thread taking a
+    # fixed ~20ms per call: frames must queue up behind each other, and
+    # that wait has to show up in total_ms even though it's invisible to
+    # any individual stage's own duration.
+    sources = [make_video(tmp_path, "a.mp4", n_frames=10, seed=1)]
+    backend = MockInferenceBackend(
+        latency_table={(ModelTier.NANO, Precision.INT8): 20.0},
+        jitter_ms=0.0,
+    )
+    pipeline, tracker = build_pipeline(
+        queue_config=lossless_queue_config(),
+        batch_config=BatchConfig(max_batch_size=1, batch_timeout_ms=5.0),
+        backend=backend,
+    )
+
+    pipeline.run(sources, join_timeout=15)
+
+    gaps = [
+        s.total_ms - (s.decode_ms + s.preprocess_ms + s.inference_ms + s.postprocess_ms)
+        for s in tracker.samples
+    ]
+    # The later frames in this 10-frame backlog wait behind several ~20ms
+    # inference calls before their own turn -- tens of ms of queueing delay
+    # that a sum-of-stages total would have silently missed entirely.
+    assert max(gaps) > 50.0
