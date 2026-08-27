@@ -1,0 +1,15 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+results/
+sweep_work/
+*.engine
+*.onnx
+*.pt
+*.pth
+*.mp4
+*.avi
+*.mov
+*.mkv

@@ -1,0 +1,83 @@
+{
+  "title": "StreamGuard",
+  "uid": "streamguard-overview",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "End-to-end latency (live histogram)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0 } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "p99" }, "properties": [{ "id": "color", "value": { "fixedColor": "#e34948", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "p95" }, "properties": [{ "id": "color", "value": { "fixedColor": "#eda100", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "p50" }, "properties": [{ "id": "color", "value": { "fixedColor": "#2a78d6", "mode": "fixed" } }] }
+        ]
+      },
+      "targets": [
+        { "expr": "streamguard_latency_p50_ms", "legendFormat": "p50", "refId": "A" },
+        { "expr": "streamguard_latency_p95_ms", "legendFormat": "p95", "refId": "B" },
+        { "expr": "streamguard_latency_p99_ms", "legendFormat": "p99", "refId": "C" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Degradation tier",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "gridPos": { "h": 7, "w": 6, "x": 0, "y": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 5,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#0ca30c", "value": null },
+              { "color": "#fab219", "value": 2 },
+              { "color": "#d03b3b", "value": 4 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "expr": "streamguard_degradation_tier", "legendFormat": "tier", "refId": "A" }]
+    },
+    {
+      "id": 3,
+      "title": "Frames processed (total)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "gridPos": { "h": 7, "w": 6, "x": 6, "y": 9 },
+      "targets": [{ "expr": "streamguard_frames_processed_total", "legendFormat": "frames", "refId": "A" }]
+    },
+    {
+      "id": 4,
+      "title": "Queue depth",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 9 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 } }
+      },
+      "targets": [{ "expr": "streamguard_queue_depth", "legendFormat": "{{queue}}", "refId": "A" }]
+    },
+    {
+      "id": 5,
+      "title": "Dropped frames (cumulative, by queue)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 } }
+      },
+      "targets": [{ "expr": "streamguard_dropped_frames_total", "legendFormat": "{{queue}}", "refId": "A" }]
+    }
+  ]
+}

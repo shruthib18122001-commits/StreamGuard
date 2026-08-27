@@ -1,0 +1,41 @@
+# UNVERIFIED: no Docker on this dev machine to run `docker compose up`
+# against. GPU reservation uses the modern Compose syntax
+# (deploy.resources.reservations.devices) -- on a host without the NVIDIA
+# Container Toolkit installed, this block is meant to be ignored rather
+# than fail the whole file, but that hasn't been confirmed here.
+services:
+  streamguard:
+    build: .
+    ports:
+      - "9108:9108"
+    volumes:
+      - ./configs:/app/configs:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - streamguard
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboard.json:/var/lib/grafana/dashboards/streamguard.json:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+    depends_on:
+      - prometheus
