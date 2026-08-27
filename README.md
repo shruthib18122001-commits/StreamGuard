@@ -529,6 +529,18 @@ tested for graceful, clear failure in the absence of CUDA/TensorRT/CuPy —
 see [GPU-only code](#gpu-only-code-unverified-until-colab) above for what
 actually validates them.
 
+## Watching the SLA controller actually degrade (mock backend, no GPU)
+
+```bash
+python scripts/demo_sla_degradation.py
+```
+
+The clearest "does the core mechanism work" check outside the test suite:
+4 concurrent streams overload a deliberately-slow baseline tier, the
+controller drops rungs in response to real p99 values, and the printed
+transition log plus the backend's own recorded config confirm the model
+actually got reloaded — not just a latency tag changing.
+
 ## Running the live service locally (mock backend, no GPU)
 
 ```bash
