@@ -225,9 +225,14 @@ hardware before it's trusted, in this order:
 
 1. `python -c "import tensorrt, cupy; print(tensorrt.__version__, cupy.__version__)"`
    — confirm the libraries this code assumes are actually what's installed.
+   Separately check whichever NVDEC package actually installs (`PyNvCodec`
+   from VPF, or NVIDIA's newer `PyNvVideoCodec`) — `nvdec.py` is the file
+   most likely to need edits to match whatever's really there.
 2. `capture_device_info()` (stage 1) should return a real driver version and
    TensorRT version, not `None` — if it's still `None` on Colab, something's
-   wrong with the environment, not the code.
+   wrong with the environment, not the code. Do the same sanity check for
+   `NVMLSampler`: `start()`/`stop()` around a few seconds of idle time should
+   leave `unavailable_reason` as `None` and `samples` non-empty.
 3. Export one YOLOX checkpoint to ONNX (YOLOX's own tooling), then build the
    cheapest engine first: `scripts/build_engine.py --tier nano --precision
    int8 --input-size 416 --calib-dir <folder>`. Confirm it produces a
@@ -242,6 +247,14 @@ hardware before it's trusted, in this order:
 6. Only then swap `CudaEventTimer` in for `WallClockTimer` around the
    inference stage, and confirm the CUDA-event-measured latency is stable
    across repeated runs.
+7. Swap in `NVDECDecoder` and `GPUPreprocessor` the same isolated way — one
+   real video, `SingleStreamPipeline`, before touching the multi-stream
+   path. For `GPUPreprocessor` specifically, diff its output against
+   `CPUPreprocessor` on the same frame first; they should match closely.
+8. Once real predictions exist, point `evaluate_detections()` at a small
+   labeled sample set and sanity-check the mAP number is in a plausible
+   range for the tier being tested (roughly: should degrade going down the
+   ladder, not improve).
 
 The full precision/stream-count sweep is stage 6 — this checklist is just
 "does the new code work at all," not the experiment automation itself.
@@ -285,6 +298,49 @@ The full precision/stream-count sweep is stage 6 — this checklist is just
   reloaded (checked against the backend's own recorded config, not just
   the latency tags) and every frame ends up tagged with the tier that was
   really active when it ran.
+
+## What exists today (additional infrastructure)
+
+These don't map to a single numbered build-order stage — they were
+deferred throughout stages 2–4 as genuinely GPU-only or data-only work with
+no local way to verify them, and are filled in now:
+
+- **`streamguard/metrics/nvml_sampler.py`** — `NVMLSampler`: background
+  thread sampling power, SM/memory clocks, temperature, throttle reasons,
+  and memory usage at a fixed interval — the continuous telemetry that
+  distinguishes "code got slower" from "GPU throttled" (stage 1's
+  `capture_device_info()` is a one-time snapshot, not this). Same
+  graceful-degradation contract as everything else GPU-only: `start()` is
+  a documented no-op with a recorded `unavailable_reason` when there's no
+  driver, never a crash.
+
+- **`streamguard/evaluation/map_eval.py`** — `evaluate_detections()`:
+  standard object-detection mAP (all-point interpolated AP, optionally
+  averaged over COCO's 10 IoU thresholds for mAP@[.5:.95]). Pure NumPy —
+  **fully verified here** against hand-computable toy cases, including a
+  duplicate-detection case that confirms a documented, easy-to-get-wrong
+  property of this metric: a low-confidence duplicate of an
+  already-matched box counts as a false positive but doesn't reduce AP if
+  a higher-confidence detection already reached full recall. This is the
+  harness only — it needs real predictions and labeled ground truth to
+  produce a number that means anything, and there's no labeled data in
+  this repo yet.
+
+- **`streamguard/decode/nvdec.py`** — `NVDECDecoder`, real hardware decode
+  via VideoProcessingFramework's `PyNvCodec` bindings, behind the same
+  `Decoder` interface as `CPUDecoder` — this is what the NVDEC-vs-CPU
+  decode experiment needs a real baseline to run against.
+  **Least-verified file in this repo**: NVIDIA's NVDEC Python bindings
+  have shifted across versions more than TensorRT's API has, so treat the
+  exact method names here as the first thing to re-check on Colab, ahead
+  of `tensorrt_backend.py` or `cuda_timer.py` — those APIs are considerably
+  more stable.
+
+- **`streamguard/preprocess/gpu.py`** — `GPUPreprocessor`: the same
+  letterbox math as `CPUPreprocessor`, executed as CuPy device-array ops
+  so a frame can stay device-resident from decode through inference.
+  Unverified; worth checking for exact output parity against
+  `CPUPreprocessor` on the same real frame once there's a GPU to run it on.
 
 ## Degradation ladder
 

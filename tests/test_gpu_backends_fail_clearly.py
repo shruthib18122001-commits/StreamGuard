@@ -46,3 +46,30 @@ def test_cuda_event_timer_instantiation_fails_clearly_without_cupy():
 
     with pytest.raises((ModuleNotFoundError, ImportError)):
         CudaEventTimer()
+
+
+def test_nvdec_decoder_module_imports_without_gpu_libs():
+    from streamguard.decode.nvdec import NVDECDecoder
+
+    assert NVDECDecoder is not None
+
+
+def test_nvdec_decoder_open_fails_clearly_without_pynvcodec():
+    from streamguard.decode.nvdec import NVDECDecoder
+
+    decoder = NVDECDecoder()
+    with pytest.raises((ModuleNotFoundError, ImportError)):
+        decoder.open("does-not-matter.mp4")
+
+
+def test_gpu_preprocessor_module_imports_without_cupy():
+    from streamguard.preprocess.gpu import GPUPreprocessor
+
+    assert GPUPreprocessor is not None
+
+
+def test_gpu_preprocessor_process_fails_clearly_without_cupy():
+    from streamguard.preprocess.gpu import GPUPreprocessor
+
+    with pytest.raises((ModuleNotFoundError, ImportError)):
+        GPUPreprocessor().process(None, 640)
