@@ -2,13 +2,22 @@ import cv2
 import numpy as np
 import pytest
 
-from streamguard.config import BackpressurePolicy, BatchConfig, ModelTier, Precision, QueueConfig
+from streamguard.config import (
+    BackpressurePolicy,
+    BatchConfig,
+    DegradationTier,
+    ModelTier,
+    Precision,
+    QueueConfig,
+    SLAConfig,
+)
 from streamguard.decode.cpu import CPUDecoder
 from streamguard.inference.mock import MockInferenceBackend
 from streamguard.metrics.latency import LatencyTracker
 from streamguard.multi_stream_pipeline import MultiStreamPipeline
 from streamguard.postprocess import Postprocessor
 from streamguard.preprocess.cpu import CPUPreprocessor
+from streamguard.sla_controller import SLAController
 
 
 def make_video(tmp_path, name, n_frames, seed, width=160, height=120, fps=10):
@@ -157,3 +166,57 @@ def test_block_policy_processes_every_frame_even_when_slow(tmp_path):
     assert result["frames_processed"] == 15
     assert result["dropped_decode_queue"] == 0
     assert result["dropped_batch_queue"] == 0
+
+
+def test_sla_controller_degrades_and_reloads_model_across_threads(tmp_path):
+    # Baseline tier is deliberately far over deadline; the fallback tier is
+    # comfortably under it. Only BatchInferenceWorker's thread ever calls
+    # inference_backend.load() -- this test is the one that would catch a
+    # race if that contract were violated (e.g. loading from two threads,
+    # or a batch running with an input_size that doesn't match what the
+    # backend was actually loaded with).
+    sources = [make_video(tmp_path, "a.mp4", n_frames=20, seed=1)]
+    backend = MockInferenceBackend(
+        latency_table={
+            (ModelTier.M, Precision.FP16): 60.0,
+            (ModelTier.NANO, Precision.INT8): 1.0,
+        },
+        rng_seed=1,
+    )
+    backend.load(ModelTier.M, Precision.FP16, 640)
+    controller = SLAController(
+        SLAConfig(
+            degrade_threshold_ms=33.0,
+            recover_threshold_ms=10.0,
+            min_dwell_time_s=0.0,
+            ladder=[
+                DegradationTier(level=0, model_tier=ModelTier.M, precision=Precision.FP16, input_size=640),
+                DegradationTier(level=1, model_tier=ModelTier.NANO, precision=Precision.INT8, input_size=416),
+            ],
+        )
+    )
+    tracker = LatencyTracker(window_size=200, warmup_samples=0)
+    pipeline = MultiStreamPipeline(
+        decoder_factory=CPUDecoder,
+        preprocessor=CPUPreprocessor(),
+        inference_backend=backend,
+        postprocessor=Postprocessor(),
+        tracker=tracker,
+        model_input_size=640,
+        queue_config=lossless_queue_config(),
+        batch_config=BatchConfig(max_batch_size=1, batch_timeout_ms=5.0),
+        sla_controller=controller,
+    )
+
+    result = pipeline.run(sources, join_timeout=15)
+
+    assert result["frames_processed"] == 20
+    tiers_seen = [s.tier for s in tracker.samples]
+    assert tiers_seen[0] == 0
+    assert tiers_seen[-1] == 1
+    assert len(controller.transition_log) >= 1
+    # The backend's own record of what it was last configured for must
+    # match the controller's final state -- confirms the reload actually
+    # happened, not just that FrameLatency.tier was set independently.
+    assert backend.current_config["tier"] == ModelTier.NANO
+    assert backend.current_config["precision"] == Precision.INT8

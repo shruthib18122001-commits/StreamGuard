@@ -32,6 +32,7 @@ from streamguard.metrics.latency import FrameLatency, LatencyTracker
 from streamguard.metrics.timer import WallClockTimer
 from streamguard.postprocess import Postprocessor
 from streamguard.preprocess.base import Preprocessor, PreprocessMeta
+from streamguard.sla_controller import SLAController
 
 
 @dataclass
@@ -58,6 +59,7 @@ class InferredItem:
     decode_ms: float
     preprocess_ms: float
     inference_ms: float
+    tier: int = 0
 
 
 class ActiveCounter:
@@ -145,13 +147,18 @@ class PreprocessWorker(_SafeThread):
         input_queue: BoundedQueue,
         output_queue: BoundedQueue,
         preprocessor: Preprocessor,
-        model_input_size: int,
+        input_size_fn: Callable[[], int],
     ):
         super().__init__(name="preprocess")
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.preprocessor = preprocessor
-        self.model_input_size = model_input_size
+        # A callable, not a fixed int: when an SLAController is active, the
+        # target size can change (e.g. 640 -> 416) the moment a degradation
+        # tier drops, and every frame must be letterboxed to whatever's
+        # active *right now* -- reading it fresh here is what makes that
+        # actually take effect, rather than being fixed at construction.
+        self.input_size_fn = input_size_fn
 
     def _run_safe(self) -> None:
         try:
@@ -160,7 +167,7 @@ class PreprocessWorker(_SafeThread):
                 if item is None:
                     break
                 with WallClockTimer() as t:
-                    processed, meta = self.preprocessor.process(item.frame, self.model_input_size)
+                    processed, meta = self.preprocessor.process(item.frame, self.input_size_fn())
                 try:
                     self.output_queue.put(
                         PreprocessedItem(
@@ -185,6 +192,7 @@ class BatchInferenceWorker(_SafeThread):
         inference_backend: InferenceBackend,
         max_batch_size: int,
         batch_timeout_ms: float,
+        sla_controller: Optional[SLAController] = None,
     ):
         super().__init__(name="batch-infer")
         self.input_queue = input_queue
@@ -193,6 +201,12 @@ class BatchInferenceWorker(_SafeThread):
         self.max_batch_size = max_batch_size
         self.batch_timeout_ms = batch_timeout_ms
         self.batch_sizes_seen: List[int] = []
+        self.sla_controller = sla_controller
+        # None, not 0: forces a load() before the very first batch when a
+        # controller is present, so this thread's model state is always
+        # derived from the controller rather than trusting that whatever
+        # the caller pre-loaded happens to match level 0.
+        self._loaded_level: Optional[int] = None
 
     def _collect_batch(self) -> "tuple[List[PreprocessedItem], bool]":
         """Collect until max_batch_size items or batch_timeout_ms since the
@@ -227,7 +241,21 @@ class BatchInferenceWorker(_SafeThread):
         finally:
             self.output_queue.close()
 
+    def _maybe_reload_model(self) -> int:
+        """Apply a pending tier change if the controller has moved since our
+        last batch. Only this thread ever touches inference_backend, so
+        there's no risk of a load() racing an in-flight infer() call."""
+        if self.sla_controller is None:
+            return 0
+        level = self.sla_controller.current_level
+        if level != self._loaded_level:
+            tier_cfg = self.sla_controller.current_tier_config
+            self.inference_backend.load(tier_cfg.model_tier, tier_cfg.precision, tier_cfg.input_size)
+            self._loaded_level = level
+        return level
+
     def _process_batch(self, batch: List[PreprocessedItem]) -> None:
+        tier = self._maybe_reload_model()
         frames = np.stack([b.processed_frame for b in batch], axis=0)
         with WallClockTimer() as t_infer:
             raw_detections = self.inference_backend.infer(frames)
@@ -246,6 +274,7 @@ class BatchInferenceWorker(_SafeThread):
                         decode_ms=item.decode_ms,
                         preprocess_ms=item.preprocess_ms,
                         inference_ms=t_infer.elapsed_ms,
+                        tier=tier,
                     )
                 )
             except QueueClosedError:
@@ -253,11 +282,18 @@ class BatchInferenceWorker(_SafeThread):
 
 
 class PostprocessWorker(_SafeThread):
-    def __init__(self, input_queue: BoundedQueue, postprocessor: Postprocessor, tracker: LatencyTracker):
+    def __init__(
+        self,
+        input_queue: BoundedQueue,
+        postprocessor: Postprocessor,
+        tracker: LatencyTracker,
+        sla_controller: Optional[SLAController] = None,
+    ):
         super().__init__(name="postprocess")
         self.input_queue = input_queue
         self.postprocessor = postprocessor
         self.tracker = tracker
+        self.sla_controller = sla_controller
 
     def _run_safe(self) -> None:
         while True:
@@ -275,10 +311,14 @@ class PostprocessWorker(_SafeThread):
                     postprocess_ms=t.elapsed_ms,
                     total_ms=total_ms,
                     stream_id=item.stream_id,
-                    tier=0,  # hardcoded to baseline until the stage-5 SLA controller exists
+                    tier=item.tier,
                     timestamp=time.time(),
                 )
             )
+            # Right after a fresh sample lands is the natural point to
+            # re-check the SLA: the tracker's p99 is as current as it'll get.
+            if self.sla_controller is not None:
+                self.sla_controller.maybe_transition(self.tracker)
 
 
 class MultiStreamPipeline:
@@ -292,6 +332,7 @@ class MultiStreamPipeline:
         model_input_size: int,
         queue_config: QueueConfig,
         batch_config: BatchConfig,
+        sla_controller: Optional[SLAController] = None,
     ):
         self.decoder_factory = decoder_factory
         self.preprocessor = preprocessor
@@ -301,6 +342,12 @@ class MultiStreamPipeline:
         self.model_input_size = model_input_size
         self.queue_config = queue_config
         self.batch_config = batch_config
+        # Optional: without one, every frame stays tagged tier=0 and the
+        # model is never reloaded mid-run -- identical to pre-stage-5
+        # behavior. With one, PreprocessWorker reads its target size from
+        # the controller every frame, and BatchInferenceWorker reloads the
+        # model (and tags each frame's real tier) whenever it's moved.
+        self.sla_controller = sla_controller
 
     def run(
         self,
@@ -319,12 +366,18 @@ class MultiStreamPipeline:
             DecodeWorker(i, src, self.decoder_factory, decode_out_q, active, stop_event, max_frames_per_stream)
             for i, src in enumerate(sources)
         ]
-        preprocess_worker = PreprocessWorker(decode_out_q, batch_in_q, self.preprocessor, self.model_input_size)
+        if self.sla_controller is not None:
+            input_size_fn = lambda: self.sla_controller.current_tier_config.input_size  # noqa: E731
+        else:
+            fixed_size = self.model_input_size
+            input_size_fn = lambda: fixed_size  # noqa: E731
+        preprocess_worker = PreprocessWorker(decode_out_q, batch_in_q, self.preprocessor, input_size_fn)
         batch_worker = BatchInferenceWorker(
             batch_in_q, post_q, self.inference_backend,
             self.batch_config.max_batch_size, self.batch_config.batch_timeout_ms,
+            sla_controller=self.sla_controller,
         )
-        postprocess_worker = PostprocessWorker(post_q, self.postprocessor, self.tracker)
+        postprocess_worker = PostprocessWorker(post_q, self.postprocessor, self.tracker, sla_controller=self.sla_controller)
 
         all_workers: List[_SafeThread] = [*decode_workers, preprocess_worker, batch_worker, postprocess_worker]
         for w in all_workers:

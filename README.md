@@ -12,10 +12,12 @@ baked-in CUDA arch flags) for a possible later port to Jetson Orin Nano.
 
 ## Status
 
-Stage 4 of 6 (TensorRT integration, precision variants, engine build
-scripts). See [Build order](#build-order) below for what's next, and
-[GPU-only code](#gpu-only-code-unverified-until-colab) for what still needs
-validating on real hardware.
+Stage 6 of 6 (experiment automation, charts, Docker, Grafana). Core
+pipeline + SLA controller are complete and fully tested against the mock
+backend; GPU-only code (stage 4) is unverified pending Colab. See
+[Build order](#build-order) below, and
+[GPU-only code](#gpu-only-code-unverified-until-colab) for what needs
+validating on real hardware before the experiment sweeps mean anything.
 
 ## Architecture
 
@@ -244,7 +246,47 @@ hardware before it's trusted, in this order:
 The full precision/stream-count sweep is stage 6 — this checklist is just
 "does the new code work at all," not the experiment automation itself.
 
-## Degradation ladder (config-defined, controller lands in stage 5)
+## What exists today (stage 5 additions)
+
+- **`streamguard/sla_controller.py`** — `SLAController`: reads
+  `LatencyTracker.p99()` and steps the degradation ladder one rung at a
+  time when it crosses `degrade_threshold_ms`/`recover_threshold_ms`,
+  gated by `min_dwell_time_s`. Fully testable against the mock backend —
+  no GPU needed, same as everything through stage 3.
+
+  **Why one rung at a time, even under severe overload:** the controller
+  re-evaluates on the next sample after its dwell time elapses and steps
+  again if still needed. This finds the *minimum* sufficient degradation
+  rather than jumping straight to the cheapest tier on the first bad
+  sample — otherwise "cheapest sacrifice first" wouldn't mean anything.
+
+  **The interesting wiring problem this created:** the controller decides
+  *when* to change tier, but only `BatchInferenceWorker`'s thread is
+  allowed to call `inference_backend.load()` (one execution context per
+  worker thread — the same rule from the measurement requirements). So
+  `SLAController` only exposes thread-safe state (`current_level`,
+  `current_tier_config`); `PreprocessWorker` now reads the target
+  `input_size` fresh *per frame* via a callable instead of a value fixed
+  at construction (a tier change can shrink 640→416 mid-run), and
+  `BatchInferenceWorker` checks the controller's level before each batch
+  and calls `load()` itself if it's moved, tagging every frame in that
+  batch with the tier that was actually active for it. `PostprocessWorker`
+  just uses that tag and triggers `maybe_transition()` after each fresh
+  sample — no cross-thread writes to the inference backend from anywhere
+  but the one thread that owns it.
+
+  `SingleStreamPipeline` (stage 2) got the same optional `sla_controller`
+  parameter for consistency, trivially simpler there since it's one
+  thread — no "which thread is allowed to call load()" question at all.
+
+  Verified with a cross-thread integration test: a backend configured with
+  a deliberately-slow baseline tier and a fast fallback tier, run through
+  the full multi-threaded pipeline, confirms the model actually gets
+  reloaded (checked against the backend's own recorded config, not just
+  the latency tags) and every frame ends up tagged with the tier that was
+  really active when it ran.
+
+## Degradation ladder
 
 | Level | Model      | Precision | Size | Frame skip |
 |-------|------------|-----------|------|------------|
@@ -261,8 +303,8 @@ The full precision/stream-count sweep is stage 6 — this checklist is just
 2. ✅ Single-stream end-to-end with real latency instrumentation
 3. ✅ Multi-stream: bounded queues, dynamic batching
 4. ✅ TensorRT integration, precision variants, engine build scripts (unverified — see checklist above)
-5. SLA controller: degradation ladder + hysteresis
-6. Experiment automation, charts, Docker, Grafana, README completion
+5. ✅ SLA controller: degradation ladder + hysteresis
+6. 🔧 Experiment automation, charts, Docker, Grafana, README completion (in progress)
 
 ## Results
 
