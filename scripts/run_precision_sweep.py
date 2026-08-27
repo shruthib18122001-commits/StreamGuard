@@ -26,10 +26,17 @@ def main() -> None:
     parser.add_argument("--output", default="./results/precision_sweep.csv")
     parser.add_argument("--max-frames-per-stream", type=int, default=120)
     parser.add_argument("--sample-power", action="store_true", help="bracket each trial with NVMLSampler")
+    parser.add_argument("--backend", choices=["mock", "tensorrt"], default="mock")
+    parser.add_argument("--engine-dir", default="./engines", help="required when --backend tensorrt")
     args = parser.parse_args()
 
     sources = resolve_sources(count=args.stream_count, output_dir=args.work_dir, source_dir=args.source_dir)
-    backend = MockInferenceBackend()
+    if args.backend == "tensorrt":
+        from streamguard.inference.tensorrt_backend import TensorRTInferenceBackend
+
+        backend = TensorRTInferenceBackend(engine_dir=args.engine_dir)
+    else:
+        backend = MockInferenceBackend()
     nvml = NVMLSampler() if args.sample_power else None
 
     results = sweep_precision(

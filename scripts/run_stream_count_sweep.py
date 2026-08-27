@@ -3,7 +3,7 @@
 deadline is violated, writing one CSV row per stream count tried.
 
 Runnable today against the mock backend (streamguard.inference.mock) to
-verify the sweep logic itself; point --backend at tensorrt once stage 4 is
+verify the sweep logic itself; pass --backend tensorrt once stage 4 is
 verified on real hardware for numbers that actually mean something.
 """
 from __future__ import annotations
@@ -13,7 +13,7 @@ import csv
 import dataclasses
 import os
 
-from streamguard.config import DEFAULT_LADDER, ModelTier, Precision
+from streamguard.config import DEFAULT_LADDER
 from streamguard.decode.cpu import CPUDecoder
 from streamguard.experiments.sources import resolve_sources
 from streamguard.experiments.stream_count_sweep import sweep_stream_counts
@@ -30,14 +30,21 @@ def main() -> None:
     parser.add_argument("--work-dir", default="./sweep_work", help="scratch dir for synthetic clips (not committed)")
     parser.add_argument("--output", default="./results/stream_count_sweep.csv")
     parser.add_argument("--max-frames-per-stream", type=int, default=120)
-    parser.add_argument("--backend", choices=["mock"], default="mock", help="tensorrt lands once stage 4 is verified")
+    parser.add_argument("--backend", choices=["mock", "tensorrt"], default="mock")
+    parser.add_argument("--engine-dir", default="./engines", help="required when --backend tensorrt")
     args = parser.parse_args()
 
     tier = next(t for t in DEFAULT_LADDER if t.level == args.tier_level)
     sources = resolve_sources(
         count=max(args.stream_counts), output_dir=args.work_dir, source_dir=args.source_dir,
     )
-    backend = MockInferenceBackend()
+
+    if args.backend == "tensorrt":
+        from streamguard.inference.tensorrt_backend import TensorRTInferenceBackend
+
+        backend = TensorRTInferenceBackend(engine_dir=args.engine_dir)
+    else:
+        backend = MockInferenceBackend()
 
     results = sweep_stream_counts(
         stream_counts=args.stream_counts,

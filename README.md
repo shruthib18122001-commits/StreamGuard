@@ -12,12 +12,13 @@ baked-in CUDA arch flags) for a possible later port to Jetson Orin Nano.
 
 ## Status
 
-Stage 6 of 6 (experiment automation, charts, Docker, Grafana). Core
-pipeline + SLA controller are complete and fully tested against the mock
-backend; GPU-only code (stage 4) is unverified pending Colab. See
-[Build order](#build-order) below, and
-[GPU-only code](#gpu-only-code-unverified-until-colab) for what needs
-validating on real hardware before the experiment sweeps mean anything.
+All 6 build-order stages complete. The pipeline, SLA controller, experiment
+automation, and chart rendering are fully tested against the mock backend
+on CPU — 120 tests, no GPU required. What's *not* verified: anything that
+touches real CUDA/TensorRT/NVDEC/Docker, since there's no GPU or Docker on
+this dev machine. See [GPU-only code](#gpu-only-code-unverified-until-colab)
+for the validation checklist to run before trusting any real number out of
+this, and [Results](#results) — still placeholders until that happens.
 
 ## Architecture
 
@@ -211,12 +212,14 @@ Source -> NVDEC decode -> GPU preprocess -> batch -> TensorRT -> postprocess -> 
   trade. This script starts from an already-exported `.onnx` file.
   **Unverified**, same reason as above.
 
-- Three tests (`test_gpu_backends_fail_clearly.py`) lock in a narrower,
-  honestly-testable promise for the two GPU-only modules: importing them
-  must not require CuPy/TensorRT (their imports are deferred into method
-  bodies, not module level), and calling into them without their
-  prerequisites must fail with a specific, clear error — not silently
-  produce garbage or die three layers down with an obscure traceback.
+- `test_gpu_backends_fail_clearly.py` (later grown to 9 tests, covering
+  `nvdec.py` and `gpu.py` too — see "additional infrastructure" below)
+  locks in a narrower, honestly-testable promise for every GPU-only
+  module: importing them must not require CuPy/TensorRT (their imports are
+  deferred into method bodies, not module level), and calling into them
+  without their prerequisites must fail with a specific, clear error — not
+  silently produce garbage or die three layers down with an obscure
+  traceback.
 
 ### GPU-only code: unverified until Colab
 
@@ -299,6 +302,86 @@ The full precision/stream-count sweep is stage 6 — this checklist is just
   the latency tags) and every frame ends up tagged with the tier that was
   really active when it ran.
 
+## What exists today (stage 6 additions)
+
+- **`streamguard/experiments/`** — the sweep logic, as importable/testable
+  library functions (thin CLI wrappers live under `scripts/`):
+  - `stream_count_sweep.py`: ramps concurrent stream count at a fixed
+    degradation tier until p99 violates the deadline, stopping one trial
+    past the first violation and reporting the max sustainable N.
+  - `precision_sweep.py`: one trial per ladder rung — latency, throughput,
+    and (when an `NVMLSampler` is supplied and available) mean power draw.
+  - `map_trial.py`: per-tier mAP, deliberately bypassing
+    `MultiStreamPipeline` entirely — evaluating against a fixed labeled set
+    is an offline concern, not a live-streaming one, so it doesn't need any
+    of the queueing/threading machinery.
+  - `decode_comparison.py`: CPU-vs-NVDEC decode throughput and CPU
+    utilization (only CPU is runnable here).
+  - `sources.py`: resolves real video files (round-robin reused up to the
+    requested count) or generates synthetic clips when none are supplied.
+
+  All runnable today against the mock backend to verify the automation
+  *logic* — and actually run, not just written: the stream-count sweep
+  script found that at low stream counts, `batch_timeout_ms`'s wait (for a
+  batch that will never fill, since there's nothing else to batch with)
+  adds pure latency for zero benefit — see **What didn't work** below.
+  Point `--backend tensorrt --engine-dir <dir>` at a real engine directory
+  once stage 4 is verified for numbers that mean something.
+
+- **`streamguard/experiments/render_charts.py`** — matplotlib frontier
+  charts (latency vs. stream count, throughput/latency/power per tier, the
+  throughput-latency frontier curve itself), following the `dataviz`
+  skill's validated default palette: categorical slots 1–3 for the three
+  percentile lines, a single-hue **ordinal** ramp for the ladder tiers
+  (they're a genuine ordered progression, not arbitrary categories — this
+  is the palette's documented ordinal use case, not a generic 6-color
+  categorical scheme). `matplotlib` is an optional (`viz`) dependency,
+  imported lazily so `streamguard.experiments` stays importable without it
+  — checked by actually uninstalling matplotlib and confirming the package
+  still imports, with only the plotting functions failing, clearly.
+  Rendered and visually inspected against real (mock-backend) sweep
+  output, not just "didn't crash."
+
+- **`streamguard/metrics/prometheus_exporter.py`** — `PrometheusExporter`:
+  latency percentiles, frames processed, degradation tier, and per-queue
+  depth/drop counts as Prometheus gauges. A private `CollectorRegistry` per
+  instance avoids colliding with the client library's global default.
+  Tested via `generate_latest()` against the registry directly, so no real
+  HTTP port is needed for the test suite.
+
+- **`scripts/serve.py`** — the actual long-running service entrypoint (what
+  the Docker image's default command runs): wires `MultiStreamPipeline` +
+  `SLAController` + `PrometheusExporter` together, with a background
+  thread pushing tracker/controller state into the exporter on an
+  interval. Actually run end-to-end against the mock backend — multiple
+  loops completed cleanly with no exceptions. Couldn't confirm the metrics
+  HTTP endpoint is reachable via `curl` from this specific sandboxed shell;
+  verified that's a sandbox network restriction (an unrelated plain stdlib
+  HTTP server is equally unreachable the same way here), not a bug in the
+  exporter or the service.
+
+- **`Dockerfile`, `docker-compose.yml`, `docker/`** — the CUDA-based image,
+  a compose file wiring `streamguard` + `prometheus` + `grafana` together
+  (GPU reservation via the modern Compose `deploy.resources.reservations`
+  syntax), Prometheus's scrape config, and Grafana's datasource/dashboard
+  provisioning plus the dashboard JSON itself (latency histogram,
+  degradation tier, queue depth, dropped frames — the panels CLAUDE.md
+  asks for). **Unverified** — no Docker on this dev machine to build or run
+  against — but JSON/YAML syntax is validated, and a test cross-checks
+  every dashboard panel's PromQL expression against the exporter's actual
+  metric names, so a renamed gauge would fail a test rather than silently
+  break a panel.
+
+- **`notebooks/streamguard_colab.ipynb`** — the Colab runbook: clone →
+  install → confirm GPU/driver/TensorRT versions → (external step: export
+  YOLOX to ONNX) → build one engine per ladder rung → the single-frame and
+  single-stream validation steps from the checklist below, in order →
+  run the sweeps for real → render the charts. Structurally validated
+  (valid nbformat JSON, every code cell's Python syntax-checked), but never
+  executed — no Jupyter/Colab runtime here. The clone cell has a clearly
+  marked placeholder for this repo's GitHub URL, filled in once it's
+  pushed somewhere.
+
 ## What exists today (additional infrastructure)
 
 These don't map to a single numbered build-order stage — they were
@@ -360,33 +443,100 @@ no local way to verify them, and are filled in now:
 3. ✅ Multi-stream: bounded queues, dynamic batching
 4. ✅ TensorRT integration, precision variants, engine build scripts (unverified — see checklist above)
 5. ✅ SLA controller: degradation ladder + hysteresis
-6. 🔧 Experiment automation, charts, Docker, Grafana, README completion (in progress)
+6. ✅ Experiment automation, charts, Docker, Grafana, README completion
 
 ## Results
 
-_Placeholder — populated once real streams run on Colab T4 hardware:_
+_Placeholder — populated once real streams run on Colab T4 hardware, via
+the [Colab notebook](notebooks/streamguard_colab.ipynb) and the checklist
+above:_
 
 - Max sustainable stream count per degradation tier: **TBD**
 - NVDEC vs CPU decode throughput / CPU utilization: **TBD**
 - FP32 / FP16 / INT8 latency, throughput, power, mAP sweep: **TBD**
 - Degradation tier transition timeline under load: **TBD**
 
+The sweep *automation itself* is verified end-to-end against the mock
+backend (`streamguard/experiments/`, 16 tests) — running it produces real
+CSVs and real charts, like the frontier plot below (mock-backend numbers,
+not real hardware — placeholders above still apply). What's missing is
+stage 4's GPU code actually running, which is what turns these from
+"the harness works" into "here's what StreamGuard actually does":
+
+![Throughput/latency frontier across the degradation ladder, mock backend](docs/frontier_example.png)
+
 ## What didn't work
 
-_Running log of failed approaches and why — kept because it's often the most
-credible part of a systems project. Empty for now; stage 1 has no GPU-facing
-code to fail yet._
+_Kept because it's often the most credible part of a systems project —_
+_these were all found by actually running the code, not by inspection:_
+
+- **`total_ms` silently ignored queueing delay.** Through stage 4,
+  `MultiStreamPipeline`'s per-frame `total_ms` was the sum of each stage's
+  own active duration (decode + preprocess + inference + postprocess). Under
+  real concurrent load a frame can sit in a bounded queue waiting its turn
+  — e.g. backed up behind other frames at the batcher — and that wait was
+  invisible to every one of those four numbers. Both the SLA controller
+  (reads `total_ms`'s p99 to decide when to degrade) and the stream-count
+  sweep (needs `total_ms` to actually rise under overload) would have
+  silently missed real backpressure. Fixed by threading a frame-start
+  timestamp through the pipeline and computing `total_ms` as true
+  wall-clock elapsed time since decode began, not a sum of durations —
+  caught by a regression test before it reached anything downstream.
+
+- **Dynamic batching's fixed timeout hurts low-concurrency latency, for no
+  throughput benefit.** Running the stream-count sweep at N=1 against the
+  mock backend's baseline tier showed p99 latency around **90ms** — nearly
+  3x the 33ms deadline — even though a single frame's actual decode/
+  preprocess/inference/postprocess cost is a fraction of that.
+  `BatchInferenceWorker` was waiting the full `batch_timeout_ms` (10ms
+  default) on every batch, hoping more frames would arrive to fill it —
+  frames that, with only one stream, were never coming. The timeout is
+  pure latency tax with zero throughput upside until there's enough
+  concurrent volume to actually benefit from it. Worth tuning
+  `batch_timeout_ms` down (or the SLA controller accounting for current
+  stream count) specifically in the low-N regime rather than using one
+  fixed value across the whole stream-count range.
+
+- **Truthiness bug in `MockInferenceBackend`'s constructor** (stage 1):
+  `latency_table = latency_table or DEFAULT_TIER_LATENCY_MS` silently
+  ignored an explicitly-passed *empty* dict, since `{}` is falsy in Python
+  — a test passing `latency_table={}` to check an unconfigured-tier error
+  got the default table instead and didn't fail the way it should have.
+  Fixed to an explicit `is None` check. A reminder that `x or default` is
+  the wrong idiom whenever an empty-but-valid value is meaningfully
+  different from "not provided."
+
+- **`SLAController`'s dwell-time gate blocked the very first transition**
+  (stage 5): initializing `_last_transition_time = time.time()` at
+  construction meant a test passing a synthetic `now` far from real
+  wall-clock time computed a huge (and wrongly negative-feeling) elapsed
+  gap, blocking any transition until an absurdly distant "dwell time" had
+  passed. Fixed by initializing to `0.0` instead — there's been no
+  transition yet, so the first check should never be gated by one.
 
 ## Running tests
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev,viz]"   # viz pulls in matplotlib, for the chart-rendering tests
 pytest -v
 ```
 
-No GPU required. Every stage through 3 is fully tested against the mock
-inference backend; stage 4's GPU-only modules (`tensorrt_backend.py`,
-`cuda_timer.py`, `scripts/build_engine.py`) are only tested for graceful,
-clear failure in the absence of CUDA/TensorRT — see
-[GPU-only code](#gpu-only-code-unverified-until-colab) above for what
+No GPU required — 120 tests, all passing on a plain Mac. The pipeline, SLA
+controller, and experiment automation are fully tested against the mock
+inference backend; the GPU-only modules (`tensorrt_backend.py`,
+`cuda_timer.py`, `nvdec.py`, `gpu.py`, `scripts/build_engine.py`) are only
+tested for graceful, clear failure in the absence of CUDA/TensorRT/CuPy —
+see [GPU-only code](#gpu-only-code-unverified-until-colab) above for what
 actually validates them.
+
+## Running the live service locally (mock backend, no GPU)
+
+```bash
+python scripts/serve.py --config configs/default.yaml --metrics-port 9108 --max-loops 3
+curl localhost:9108/metrics   # once it's up
+```
+
+Loops synthetic clips through the full pipeline with the SLA controller
+active, exposing Prometheus metrics the whole time. `docker-compose up`
+wires this together with real Prometheus + Grafana — unverified, since
+there's no Docker on this dev machine (see stage 6 above).
