@@ -12,7 +12,7 @@ baked-in CUDA arch flags) for a possible later port to Jetson Orin Nano.
 
 ## Status
 
-Stage 2 of 6 (single-stream end-to-end, real latency instrumentation). See
+Stage 3 of 6 (multi-stream: bounded queues, dynamic batching). See
 [Build order](#build-order) below for what's next.
 
 ## Architecture
@@ -23,16 +23,25 @@ Source -> NVDEC decode -> GPU preprocess -> batch -> TensorRT -> postprocess -> 
                                           SLA Controller (reads p99 latency)
 ```
 
-- Bounded queues between every stage (backpressure policy TBD — stage 3).
+- Bounded queues between every stage. Pre-inference queues (decode→preprocess,
+  preprocess→batch) drop the oldest frame under backpressure — a stale frame
+  only burns deadline budget, so skipping ahead to a fresher one is strictly
+  better. The post-inference queue blocks instead: by then real (simulated)
+  GPU time has already been spent, so throwing away a completed result is
+  pure waste.
 - Decode on GPU via NVDEC, with a CPU decode path kept solely to measure the gap.
 - Preprocess on GPU; frames stay device-resident from decode through output.
 - Dynamic batching aggregates frames across streams: batch on size N *or* a
-  timeout, whichever fires first (stage 3).
+  timeout since the first frame of the batch arrived, whichever fires first.
 - Concurrency model: threads + CUDA streams, one thread per pipeline stage —
-  not process-per-stream (separate CUDA contexts would kill cross-stream
-  batching) and not asyncio (CUDA work isn't awaitable, and GIL release
-  during NVDEC/cudaMemcpyAsync/TRT execute already gives the concurrency
-  asyncio would otherwise buy).
+  **except decode**, which gets one thread *per stream* (each source is an
+  independent blocking I/O resource). Preprocess, batch+infer, and
+  postprocess stay single shared threads, which is exactly what makes
+  cross-stream batching possible: one inference thread pulling from one
+  queue fed by every stream. Not process-per-stream (separate CUDA contexts
+  would kill cross-stream batching) and not asyncio (CUDA work isn't
+  awaitable, and GIL release during NVDEC/cudaMemcpyAsync/TRT execute
+  already gives the concurrency asyncio would otherwise buy).
 
 ## What exists today (stage 1)
 
@@ -119,6 +128,48 @@ Source -> NVDEC decode -> GPU preprocess -> batch -> TensorRT -> postprocess -> 
   to get the interfaces and instrumentation right on the simplest possible
   case before concurrency is layered on top.
 
+## What exists today (stage 3 additions)
+
+- **`streamguard/bounded_queue.py`** — `BoundedQueue`: thread-safe, with an
+  explicit per-instance backpressure policy. `BLOCK` behaves like stdlib
+  `queue.Queue`; `DROP_OLDEST` evicts the oldest item to make room instead
+  of blocking the producer, and counts every eviction (`dropped_count`) —
+  the stdlib queue has no such mode, so this wraps a `deque` with our own
+  locking to add one. `get(timeout=...)` raises `queue.Empty` on timeout,
+  and returns `None` — a distinct, permanent sentinel — only once the queue
+  has been closed *and* drained.
+
+- **`streamguard/config.py`** additions — `QueueConfig` (per-hop size +
+  `BackpressurePolicy`) and `BatchConfig` (`max_batch_size`,
+  `batch_timeout_ms`). Defaults match the policy above: drop-oldest pre-
+  inference, block post-inference.
+
+- **`streamguard/multi_stream_pipeline.py`** — `MultiStreamPipeline` and its
+  four worker types (`DecodeWorker` ×N, `PreprocessWorker`,
+  `BatchInferenceWorker`, `PostprocessWorker`), connected by `BoundedQueue`s.
+  `BatchInferenceWorker` collects frames from any stream until
+  `max_batch_size` is reached or `batch_timeout_ms` has elapsed since the
+  first frame of the current batch, whichever fires first, then runs one
+  `inference_backend.infer()` call per batch.
+
+  **A subtlety worth flagging:** every frame in a dispatched batch is
+  charged the *full* batch inference latency, not `latency / N` — all
+  frames in a synchronous batch complete at the same instant, so that's
+  genuinely each one's wait. Measured with 4 concurrent synthetic streams
+  and a fixed ~25ms mock inference cost per call: `max_batch_size=1` gave
+  34 fps at p99 total latency 33.1ms (right at the deadline); `max_batch_size=8`
+  gave 238 fps — a ~7x throughput gain — but p99 rose to 38.1ms, over the
+  33ms deadline. Bigger batches move more frames through the GPU per
+  second, at the cost of every one of those frames waiting longer. This is
+  exactly the tension the stage-5 SLA controller has to manage.
+
+  Each worker thread captures its own exceptions instead of dying silently
+  (`_SafeThread`), and `MultiStreamPipeline.run()` checks for both hung
+  threads (via a join timeout) and captured errors after shutdown — with N
+  decode threads, a shared batching stage, and bounded queues in between,
+  a bug that silently wedges one thread would otherwise surface as a
+  mysterious test hang instead of a clear failure.
+
 ## Degradation ladder (config-defined, controller lands in stage 5)
 
 | Level | Model      | Precision | Size | Frame skip |
@@ -134,7 +185,7 @@ Source -> NVDEC decode -> GPU preprocess -> batch -> TensorRT -> postprocess -> 
 
 1. ✅ Skeleton, config system, metrics collection, mock inference backend
 2. ✅ Single-stream end-to-end with real latency instrumentation
-3. Multi-stream: bounded queues, dynamic batching
+3. ✅ Multi-stream: bounded queues, dynamic batching
 4. TensorRT integration, precision variants, engine build scripts
 5. SLA controller: degradation ladder + hysteresis
 6. Experiment automation, charts, Docker, Grafana, README completion

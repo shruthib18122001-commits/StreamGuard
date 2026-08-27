@@ -21,3 +21,15 @@ sla:
   window_size: 200              # rolling window size (frames) for percentile calc
   warmup_samples: 30            # discarded before entering the rolling window
   # ladder omitted -> falls back to DEFAULT_LADDER in streamguard/config.py
+
+queues:
+  decode_queue_size: 8
+  batch_queue_size: 16
+  postprocess_queue_size: 32
+  decode_queue_policy: drop_oldest       # stale pre-inference frames just burn deadline budget
+  batch_queue_policy: drop_oldest         # same reasoning, one hop later
+  postprocess_queue_policy: block         # never discard a result inference already paid for
+
+batching:
+  max_batch_size: 8
+  batch_timeout_ms: 10.0        # batch dispatches at 8 frames or 10ms, whichever first

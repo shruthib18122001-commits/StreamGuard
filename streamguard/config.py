@@ -106,10 +106,43 @@ class StreamConfig(BaseModel):
     sources: Optional[List[str]] = None
 
 
+class BackpressurePolicy(str, Enum):
+    BLOCK = "block"
+    DROP_OLDEST = "drop_oldest"
+
+
+class QueueConfig(BaseModel):
+    """Bounded-queue sizes and backpressure policy for each hop in the
+    pipeline. Pre-inference queues default to dropping the oldest frame when
+    full — a stale frame only burns deadline budget, so skipping ahead to a
+    fresher one is strictly better. The post-inference queue defaults to
+    blocking instead, since by then real (simulated) GPU time has already
+    been spent on that frame; throwing away a completed result is pure
+    waste that a blocked producer upstream doesn't cost us."""
+
+    decode_queue_size: int = Field(default=8, gt=0)
+    batch_queue_size: int = Field(default=16, gt=0)
+    postprocess_queue_size: int = Field(default=32, gt=0)
+    decode_queue_policy: BackpressurePolicy = BackpressurePolicy.DROP_OLDEST
+    batch_queue_policy: BackpressurePolicy = BackpressurePolicy.DROP_OLDEST
+    postprocess_queue_policy: BackpressurePolicy = BackpressurePolicy.BLOCK
+
+
+class BatchConfig(BaseModel):
+    """Dynamic batching: accumulate frames from any stream until either
+    `max_batch_size` is reached or `batch_timeout_ms` has elapsed since the
+    first frame of the current batch arrived, whichever fires first."""
+
+    max_batch_size: int = Field(default=8, gt=0)
+    batch_timeout_ms: float = Field(default=10.0, gt=0)
+
+
 class StreamGuardConfig(BaseModel):
     streams: StreamConfig = Field(default_factory=StreamConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
     sla: SLAConfig = Field(default_factory=SLAConfig)
+    queues: QueueConfig = Field(default_factory=QueueConfig)
+    batching: BatchConfig = Field(default_factory=BatchConfig)
     device: str = "cuda:0"
 
 
