@@ -12,8 +12,10 @@ baked-in CUDA arch flags) for a possible later port to Jetson Orin Nano.
 
 ## Status
 
-Stage 3 of 6 (multi-stream: bounded queues, dynamic batching). See
-[Build order](#build-order) below for what's next.
+Stage 4 of 6 (TensorRT integration, precision variants, engine build
+scripts). See [Build order](#build-order) below for what's next, and
+[GPU-only code](#gpu-only-code-unverified-until-colab) for what still needs
+validating on real hardware.
 
 ## Architecture
 
@@ -170,6 +172,78 @@ Source -> NVDEC decode -> GPU preprocess -> batch -> TensorRT -> postprocess -> 
   a bug that silently wedges one thread would otherwise surface as a
   mysterious test hang instead of a clear failure.
 
+## What exists today (stage 4 additions)
+
+- **`streamguard/inference/yolox_decode.py`** — `decode_yolox_output()`:
+  turns YOLOX's raw anchor-free network output (grid-cell predictions
+  across feature-map strides 8/16/32) into the same `Detection` objects the
+  mock backend already returns, so `postprocess.py`'s NMS and coordinate
+  inversion don't change at all regardless of which backend produced them.
+  Pure NumPy math on tensor shapes — **this is the one piece of stage 4
+  actually verified here**, including an exact-coordinate test (a
+  hand-encoded anchor decodes to precisely the expected box).
+
+- **`streamguard/metrics/cuda_timer.py`** — `CudaEventTimer`, implementing
+  the same `Timer` contract as `WallClockTimer` (stage 2) but using real
+  CUDA events instead of a host clock — this is the actual mechanism
+  CLAUDE.md's measurement rule requires for GPU stages. **Unverified**: no
+  CuPy, no CUDA device here.
+
+- **`streamguard/inference/tensorrt_backend.py`** — `TensorRTInferenceBackend`,
+  implementing the same `InferenceBackend` interface the mock backend does
+  (loads a serialized engine, one execution context per instance, pinned
+  host buffers for the H2D copy, calls the decode function above). Uses
+  CuPy — not `pycuda` — for all device memory, since CuPy's already the
+  intended tool for GPU preprocessing. **Unverified**: written against the
+  documented TensorRT 8.5+ `execute_async_v3`/tensor-address API, but there
+  is no NVIDIA driver, CUDA, or TensorRT on this dev machine to actually
+  run it against.
+
+- **`scripts/build_engine.py`** — ONNX → `.engine`, precision selectable
+  (fp32/fp16/int8), with an `IInt8EntropyCalibrator2` for the INT8 path
+  that reads a folder of representative frames (path supplied externally;
+  never committed, per `.gitignore`). Deliberately does **not** handle
+  YOLOX-checkpoint → ONNX export — that needs YOLOX's own
+  `tools/export_onnx.py` and its model-definition code, and pulling that
+  dependency into this repo just to re-derive ONNX export was the wrong
+  trade. This script starts from an already-exported `.onnx` file.
+  **Unverified**, same reason as above.
+
+- Three tests (`test_gpu_backends_fail_clearly.py`) lock in a narrower,
+  honestly-testable promise for the two GPU-only modules: importing them
+  must not require CuPy/TensorRT (their imports are deferred into method
+  bodies, not module level), and calling into them without their
+  prerequisites must fail with a specific, clear error — not silently
+  produce garbage or die three layers down with an obscure traceback.
+
+### GPU-only code: unverified until Colab
+
+Everything above marked unverified needs to be checked against real
+hardware before it's trusted, in this order:
+
+1. `python -c "import tensorrt, cupy; print(tensorrt.__version__, cupy.__version__)"`
+   — confirm the libraries this code assumes are actually what's installed.
+2. `capture_device_info()` (stage 1) should return a real driver version and
+   TensorRT version, not `None` — if it's still `None` on Colab, something's
+   wrong with the environment, not the code.
+3. Export one YOLOX checkpoint to ONNX (YOLOX's own tooling), then build the
+   cheapest engine first: `scripts/build_engine.py --tier nano --precision
+   int8 --input-size 416 --calib-dir <folder>`. Confirm it produces a
+   `.engine` file without error.
+4. Load that engine with `TensorRTInferenceBackend` and call `infer()` on one
+   real preprocessed frame. Confirm no exceptions and sane detection
+   count/box coordinates.
+5. Swap `TensorRTInferenceBackend` in for `MockInferenceBackend` in
+   `SingleStreamPipeline` against one short real video before touching
+   `MultiStreamPipeline` — isolate TensorRT problems from concurrency
+   problems.
+6. Only then swap `CudaEventTimer` in for `WallClockTimer` around the
+   inference stage, and confirm the CUDA-event-measured latency is stable
+   across repeated runs.
+
+The full precision/stream-count sweep is stage 6 — this checklist is just
+"does the new code work at all," not the experiment automation itself.
+
 ## Degradation ladder (config-defined, controller lands in stage 5)
 
 | Level | Model      | Precision | Size | Frame skip |
@@ -186,7 +260,7 @@ Source -> NVDEC decode -> GPU preprocess -> batch -> TensorRT -> postprocess -> 
 1. ✅ Skeleton, config system, metrics collection, mock inference backend
 2. ✅ Single-stream end-to-end with real latency instrumentation
 3. ✅ Multi-stream: bounded queues, dynamic batching
-4. TensorRT integration, precision variants, engine build scripts
+4. ✅ TensorRT integration, precision variants, engine build scripts (unverified — see checklist above)
 5. SLA controller: degradation ladder + hysteresis
 6. Experiment automation, charts, Docker, Grafana, README completion
 
@@ -212,5 +286,9 @@ pip install -e ".[dev]"
 pytest -v
 ```
 
-No GPU required — everything above is testable against the mock inference
-backend.
+No GPU required. Every stage through 3 is fully tested against the mock
+inference backend; stage 4's GPU-only modules (`tensorrt_backend.py`,
+`cuda_timer.py`, `scripts/build_engine.py`) are only tested for graceful,
+clear failure in the absence of CUDA/TensorRT — see
+[GPU-only code](#gpu-only-code-unverified-until-colab) above for what
+actually validates them.

@@ -1,3 +1,4 @@
+from streamguard.metrics.cuda_timer import CudaEventTimer
 from streamguard.metrics.device import DeviceInfo, capture_device_info
 from streamguard.metrics.events import TierTransition, TransitionLog
 from streamguard.metrics.latency import FrameLatency, LatencyTracker
@@ -12,4 +13,5 @@ __all__ = [
     "LatencyTracker",
     "Timer",
     "WallClockTimer",
+    "CudaEventTimer",
 ]
