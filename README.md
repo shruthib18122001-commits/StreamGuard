@@ -378,9 +378,9 @@ The full precision/stream-count sweep is stage 6 — this checklist is just
   single-stream validation steps from the checklist below, in order →
   run the sweeps for real → render the charts. Structurally validated
   (valid nbformat JSON, every code cell's Python syntax-checked), but never
-  executed — no Jupyter/Colab runtime here. The clone cell has a clearly
-  marked placeholder for this repo's GitHub URL, filled in once it's
-  pushed somewhere.
+  executed — no Jupyter/Colab runtime here. Now points at the real repo
+  ([shruthib18122001-commits/StreamGuard](https://github.com/shruthib18122001-commits/StreamGuard))
+  instead of a placeholder.
 
 ## What exists today (additional infrastructure)
 
