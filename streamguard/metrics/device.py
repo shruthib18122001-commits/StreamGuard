@@ -21,6 +21,8 @@ class DeviceInfo:
     gpu_name: Optional[str] = None
     driver_version: Optional[str] = None
     tensorrt_version: Optional[str] = None
+    cuda_runtime_version: Optional[str] = None  # what CuPy/the app links against
+    cuda_driver_api_version: Optional[str] = None  # max CUDA the installed driver supports
     captured_at: float = 0.0
 
 
@@ -53,13 +55,29 @@ def _probe_tensorrt_version():
         return None
 
 
+def _probe_cuda_versions():
+    """CuPy reports versions as ints, e.g. 12020 -> 12.2."""
+    try:
+        import cupy as cp
+
+        def fmt(v: int) -> str:
+            return f"{v // 1000}.{(v % 1000) // 10}"
+
+        return fmt(cp.cuda.runtime.runtimeGetVersion()), fmt(cp.cuda.runtime.driverGetVersion())
+    except Exception:
+        return None, None
+
+
 def capture_device_info(device: str) -> DeviceInfo:
     gpu_name, driver_version = _probe_gpu_name_and_driver()
     tensorrt_version = _probe_tensorrt_version()
+    cuda_runtime, cuda_driver_api = _probe_cuda_versions()
     return DeviceInfo(
         device=device,
         gpu_name=gpu_name,
         driver_version=driver_version,
         tensorrt_version=tensorrt_version,
+        cuda_runtime_version=cuda_runtime,
+        cuda_driver_api_version=cuda_driver_api,
         captured_at=time.time(),
     )

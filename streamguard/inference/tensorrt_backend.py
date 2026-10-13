@@ -24,7 +24,8 @@ tool for GPU preprocessing, so this avoids a second GPU-memory library.
 from __future__ import annotations
 
 import os
-from typing import List, Optional, Tuple
+import time
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -69,6 +70,19 @@ class TensorRTInferenceBackend(InferenceBackend):
         self._h_output_pinned = None
         self._output_shape: Optional[Tuple[int, ...]] = None
 
+        # Stage 0 instrumentation: breakdown of the most recent infer() call.
+        # See infer() for exactly what each field measures and why host and
+        # GPU segments use different clocks.
+        self.last_timing: Dict[str, float] = {}
+
+    @property
+    def stream(self):
+        """The CUDA stream this backend submits work on. An external
+        CudaEventTimer must record on THIS stream to see the work: the
+        stream is created non_blocking, so it does not synchronize with the
+        legacy default stream and events recorded there would time nothing."""
+        return self._stream
+
     def _engine_path(self, tier: ModelTier, precision: Precision, input_size: int) -> str:
         return os.path.join(self._engine_dir, f"{tier.value}_{precision.value}_{input_size}.engine")
 
@@ -104,6 +118,16 @@ class TensorRTInferenceBackend(InferenceBackend):
             )
         self._input_name, self._output_name = inputs[0], outputs[0]
 
+        # YOLOX's ONNX export is NCHW (N, 3, H, W). An engine built from an
+        # NHWC profile (the pre-Stage-0 build_engine.py) would parse here
+        # but produce garbage, so fail loudly instead.
+        in_shape = tuple(engine.get_tensor_shape(self._input_name))
+        if len(in_shape) != 4 or in_shape[1] != 3:
+            raise RuntimeError(
+                f"engine input {self._input_name!r} has shape {in_shape}; expected NCHW (N, 3, H, W). "
+                "Re-export the ONNX with YOLOX tools/export_onnx.py --dynamic and rebuild the engine."
+            )
+
         # Force reallocation of device/pinned buffers for the new engine on
         # the next infer() call, even if a previous engine used the same
         # batch size -- shapes/dtypes may differ between tiers.
@@ -113,7 +137,7 @@ class TensorRTInferenceBackend(InferenceBackend):
     def _ensure_buffers(self, batch_size: int) -> None:
         import cupy as cp
 
-        input_shape = (batch_size, self._input_size, self._input_size, 3)
+        input_shape = (batch_size, 3, self._input_size, self._input_size)  # NCHW
         if self._d_input is not None and self._d_input.shape == input_shape:
             return
 
@@ -136,22 +160,61 @@ class TensorRTInferenceBackend(InferenceBackend):
         self._output_shape = output_shape
 
     def infer(self, batch: np.ndarray) -> List[List[Detection]]:
+        """batch: (N, H, W, 3) uint8 BGR host array, as produced by
+        CPUPreprocessor. Layout conversion to NCHW float32 happens here, on
+        the host, in one pass into pinned memory -- this is the "before"
+        path that Phase 2 replaces with a device-side kernel.
+
+        Sets self.last_timing with:
+          host_prep_ms / host_decode_ms -- pure CPU work, so perf_counter is
+              the correct clock (there is no async GPU work to be fooled by).
+          h2d_ms / exec_ms / d2h_ms -- GPU segments, measured with CUDA
+              events recorded on self._stream. perf_counter would only
+              capture submission time here, because these calls return
+              before the GPU finishes.
+          h2d_bytes / d2h_bytes -- bytes crossing PCIe for this call.
+        """
         if self._context is None:
             raise RuntimeError("TensorRTInferenceBackend.infer() called before load()")
+
+        import cupy as cp
 
         batch_size = batch.shape[0]
         self._ensure_buffers(batch_size)
 
+        t0 = time.perf_counter()
         host_in = np.frombuffer(self._h_input_pinned, dtype=np.float32).reshape(self._d_input.shape)
-        np.copyto(host_in, batch.astype(np.float32))
+        # NHWC uint8 -> NCHW float32 in a single pass straight into the
+        # pinned buffer (no intermediate float array). YOLOX expects raw
+        # 0-255 BGR values, so the cast is the only value transform.
+        np.copyto(host_in, batch.transpose(0, 3, 1, 2))
+        host_prep_ms = (time.perf_counter() - t0) * 1000.0
 
+        ev = [cp.cuda.Event() for _ in range(4)]
+        ev[0].record(self._stream)
         self._d_input.set(host_in, stream=self._stream)  # pinned H2D copy, async on self._stream
+        ev[1].record(self._stream)
         self._context.set_tensor_address(self._input_name, int(self._d_input.data.ptr))
         self._context.set_tensor_address(self._output_name, int(self._d_output.data.ptr))
         self._context.execute_async_v3(self._stream.ptr)
+        ev[2].record(self._stream)
 
         host_out = np.frombuffer(self._h_output_pinned, dtype=np.float32).reshape(self._output_shape)
         self._d_output.get(out=host_out, stream=self._stream)
+        ev[3].record(self._stream)
         self._stream.synchronize()  # block until the D2H copy above has actually landed
 
-        return decode_yolox_output(host_out, self._input_size, self._conf_threshold)
+        t1 = time.perf_counter()
+        detections = decode_yolox_output(host_out, self._input_size, self._conf_threshold)
+        host_decode_ms = (time.perf_counter() - t1) * 1000.0
+
+        self.last_timing = {
+            "host_prep_ms": host_prep_ms,
+            "h2d_ms": cp.cuda.get_elapsed_time(ev[0], ev[1]),
+            "exec_ms": cp.cuda.get_elapsed_time(ev[1], ev[2]),
+            "d2h_ms": cp.cuda.get_elapsed_time(ev[2], ev[3]),
+            "host_decode_ms": host_decode_ms,
+            "h2d_bytes": float(self._d_input.nbytes),
+            "d2h_bytes": float(self._d_output.nbytes),
+        }
+        return detections

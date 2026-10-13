@@ -11,14 +11,14 @@ thread, so there's no "which thread is allowed to call load()" question.
 from __future__ import annotations
 
 import time
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 
 from streamguard.decode.base import Decoder
 from streamguard.inference.base import Detection, InferenceBackend
 from streamguard.metrics.latency import FrameLatency, LatencyTracker
-from streamguard.metrics.timer import WallClockTimer
+from streamguard.metrics.timer import Timer, WallClockTimer
 from streamguard.postprocess import Postprocessor
 from streamguard.preprocess.base import Preprocessor
 from streamguard.sla_controller import SLAController
@@ -35,6 +35,7 @@ class SingleStreamPipeline:
         model_input_size: int,
         stream_id: int = 0,
         sla_controller: Optional[SLAController] = None,
+        inference_timer_factory: Optional[Callable[[], Timer]] = None,
     ):
         self.decoder = decoder
         self.preprocessor = preprocessor
@@ -45,6 +46,11 @@ class SingleStreamPipeline:
         self.stream_id = stream_id
         self.sla_controller = sla_controller
         self._loaded_level: Optional[int] = None
+        # Only the inference stage touches the GPU stream, so only it gets a
+        # swappable timer (e.g. lambda: CudaEventTimer(backend.stream)). The
+        # CPU-only stages stay on WallClockTimer, which is the right clock
+        # for work that completes synchronously on the host.
+        self._inference_timer_factory = inference_timer_factory or WallClockTimer
 
     def _current_input_size(self) -> int:
         if self.sla_controller is None:
@@ -78,7 +84,7 @@ class SingleStreamPipeline:
 
                 tier = self._maybe_reload_model()
                 batch = processed[np.newaxis, ...]
-                with WallClockTimer() as t_infer:
+                with self._inference_timer_factory() as t_infer:
                     raw_detections: List[List[Detection]] = self.inference_backend.infer(batch)
 
                 with WallClockTimer() as t_post:

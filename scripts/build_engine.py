@@ -56,7 +56,7 @@ class _Int8Calibrator(trt.IInt8EntropyCalibrator2):
             raise ValueError(f"no .jpg/.png calibration images found in {calib_dir!r}")
         self._image_paths = image_paths
         self._batch_index = 0
-        self._device_input = cp.empty((batch_size, input_size, input_size, 3), dtype=cp.float32)
+        self._device_input = cp.empty((batch_size, 3, input_size, input_size), dtype=cp.float32)  # NCHW
 
     def get_batch_size(self) -> int:
         return self._batch_size
@@ -75,7 +75,7 @@ class _Int8Calibrator(trt.IInt8EntropyCalibrator2):
             if frame is None:
                 raise ValueError(f"could not read calibration image {p!r}")
             processed, _ = self._preprocessor.process(frame, self._input_size)
-            frames.append(processed.astype(np.float32))
+            frames.append(processed.transpose(2, 0, 1).astype(np.float32))  # HWC -> CHW, raw 0-255 like the backend
         while len(frames) < self._batch_size:
             frames.append(frames[-1])  # pad the final partial batch by repeating the last frame
 
@@ -118,10 +118,21 @@ def build_engine(
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)  # 1 GiB
 
     input_tensor = network.get_input(0)
+    in_shape = tuple(input_tensor.shape)
+    if len(in_shape) != 4 or in_shape[1] != 3:
+        raise RuntimeError(f"ONNX input {input_tensor.name!r} has shape {in_shape}, expected NCHW (N, 3, H, W)")
+    if in_shape[0] != -1:
+        raise RuntimeError(
+            f"ONNX input {input_tensor.name!r} has static batch {in_shape[0]}; the dynamic batcher needs a "
+            "dynamic batch axis. Re-export with YOLOX tools/export_onnx.py --dynamic."
+        )
     profile = builder.create_optimization_profile()
-    min_shape = (1, input_size, input_size, 3)
-    opt_shape = (max(1, max_batch_size // 2), input_size, input_size, 3)
-    max_shape = (max_batch_size, input_size, input_size, 3)
+    # NCHW: that is what YOLOX's ONNX export produces. The ONNX must have been
+    # exported with --dynamic (batch axis dynamic); a static batch-1 export
+    # cannot take a min!=max profile.
+    min_shape = (1, 3, input_size, input_size)
+    opt_shape = (max(1, max_batch_size // 2), 3, input_size, input_size)
+    max_shape = (max_batch_size, 3, input_size, input_size)
     profile.set_shape(input_tensor.name, min_shape, opt_shape, max_shape)
     config.add_optimization_profile(profile)
 
