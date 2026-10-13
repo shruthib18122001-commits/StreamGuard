@@ -48,6 +48,8 @@ Source -> NVDEC decode -> GPU preprocess -> batch -> TensorRT -> postprocess -> 
   documented — unbounded queues turn overload into OOM.
 - Decode on GPU via NVDEC; also implement a CPU decode path purely to measure the gap.
 - Preprocess on GPU (CuPy/CUDA). Frame stays device-resident from decode to output.
+  Phase 2 replaces the CuPy ops with a fused CUDA kernel that writes straight into the
+  TensorRT input tensor (see "Phase 2: custom GPU kernels" below).
 - Dynamic batching aggregates frames across streams. Batch on size N **or** a
   timeout, whichever fires first. Document the throughput/latency tradeoff.
 
@@ -95,7 +97,7 @@ Source -> NVDEC decode -> GPU preprocess -> batch -> TensorRT -> postprocess -> 
 - README: architecture, every design decision with rationale, results with clearly
   marked placeholders for my measured numbers.
 
-## Build order — check in with me between stages
+## Phase 1 build order (complete; GPU-dependent parts still unverified on real hardware)
 1. Skeleton, config system, metrics collection, mock inference backend
 2. Single-stream end-to-end with real latency instrumentation
 3. Multi-stream: bounded queues, dynamic batching
@@ -110,3 +112,33 @@ Source -> NVDEC decode -> GPU preprocess -> batch -> TensorRT -> postprocess -> 
   behind an interface with a mock implementation so logic is testable locally.
 - Keep a running "what didn't work" section in the README — failed optimizations and
   why they failed are the most credible part of this project.
+
+## Phase 2: custom GPU kernels
+
+Goal: replace the most data-heavy host and CuPy steps with hand-written CUDA kernels, prove each one correct against a reference, and measure what it buys with CUDA events and bandwidth math. The headline result stays the project's own metric: max sustainable stream count per tier, before vs after.
+
+### What the current code does (verify on Colab before building on it; delete or update this subsection once Stage 0 confirms or refutes each point)
+- The pipeline is not actually device-resident. multi_stream_pipeline.py `_process_batch` does np.stack on host arrays. tensorrt_backend.infer() then does batch.astype(float32) on the host (4x the bytes of uint8), copies into pinned memory and H2D copies it. GPUPreprocessor (CuPy) returns a CuPy array that this path cannot consume.
+- After inference, the full raw output (batch x 8400 x 85 float32 at 640px, about 2.9 MB per frame) is copied D2H and decoded in NumPy inside the single inference thread, which is on the critical path.
+- scripts/build_engine.py sets the optimization profile as NHWC (N,H,W,3) and the backend allocates NHWC buffers. Standard YOLOX ONNX exports are NCHW (N,3,H,W). Expect the first engine build or run to break. Confirm and fix in Stage 0.
+- preprocess/gpu.py uses cupyx zoom, whose default coordinate mapping probably differs from cv2.INTER_LINEAR's half-pixel convention, so the docstring's claim that it matches CPUPreprocessor exactly is unproven. The new kernel must match cv2 explicitly and a test must prove it.
+
+### Operating rules (Phase 2)
+- All existing rules above still apply: CUDA events never time.time(), discard warmup, report median, p95, p99 and variance, NEVER invent numbers, raw JSON in results/ with device, driver, CUDA, TensorRT and git commit.
+- Work in stages. STOP after each stage with a summary of what was built, what was measured and what is next. Do not start the next stage until I say go.
+- Write kernels in CUDA C via CuPy RawKernel (NVRTC, so no nvcc is needed on Colab and no new dependency). Compile for the detected device, no hardcoded arch flags (Jetson-clean).
+- Every kernel sits behind an interface with a NumPy reference implementation. Tests compare kernel vs reference with explicit tolerances. GPU tests auto-skip when CUDA is unavailable. CI stays CPU-only.
+- Before writing each kernel, explain in plain terms: the thread and block mapping, the memory access pattern and whether it coalesces, exactly which bytes are read and written, and whether the kernel is memory-bound or compute-bound.
+- Roofline: for every kernel report achieved GB/s against (a) the T4 spec bandwidth (look it up and cite the source, do not rely on memory) and (b) a measured device-to-device copy bandwidth on the same machine.
+- Try Nsight Systems or Nsight Compute on Colab. If profiler counters are blocked, say so and rely on CUDA events plus bandwidth math. Never fabricate profiler output.
+- If something fails on T4, show me the exact error and the options. Do not work around it silently.
+- Add every failed attempt and every kernel that bought little to the README's "What didn't work" section, with the reason.
+
+### Stages
+0. Baseline on real hardware. Run the existing Colab runbook end to end on a T4: install, confirm GPU, driver and TensorRT versions, get a YOLOX nano or tiny ONNX, build an FP16 engine, run TensorRTInferenceBackend on one batch, run the single-stream pipeline with CudaEventTimer. Fix what breaks (expect the NHWC vs NCHW problem; NVDEC is the least verified file, so time-box it to one attempt and if it fails document it and continue with CPU decode). Record the BEFORE numbers: per-stage latency (decode, preprocess, inference, postprocess, total) at batch 1 and 8, bytes moved H2D and D2H per frame, and max sustainable stream count at the baseline tier if the sweep runs. Save to results/ as JSON and fill the README Results section with these real numbers. Write no kernel until this stage is done.
+1. Fused preprocess kernel. One kernel replaces cupyx zoom, the canvas fill and copy, the host cast to float, and the HWC to CHW conversion. Input: one decoded uint8 HWC frame on the device, any resolution. Output: written directly into slot i of a preallocated device batch tensor, NCHW, in the dtype and value range the engine expects (record what YOLOX expects and cite it). Same letterbox math as PreprocessMeta (scale, pad_x, pad_y), gray-114 padding, bilinear with cv2's half-pixel convention. Tests against CPUPreprocessor plus a NumPy transpose and cast, over odd sizes and aspect ratios, with an explicit tolerance (cv2 uses fixed-point arithmetic on uint8, so expect off-by-one differences and state the tolerance). Benchmark 720p, 1080p and 4K inputs to 416 and 640 targets at batch 1, 8 and 16: cv2 plus host cast plus H2D, vs the current CuPy path, vs the fused kernel. Report ms (CUDA events) and achieved GB/s.
+2. Device-resident batch path. The preprocessor writes into the backend's input tensor, with no np.stack and no host astype. Add an infer_device(d_input) entry point to the TensorRT backend and keep the host path for CPU decode and the mock backend. All existing tests must still pass. Add a test that proves batch assembly is slot-addressed (each slot gets the right frame). Measure bytes moved and per-stage latency against Stage 0.
+3. Fused YOLOX decode and compaction kernel. Over (batch x anchors): decode the box from grid and stride, take the argmax over classes (parallel reduction across the class dimension), compute conf = obj * cls, threshold, and compact survivors into a fixed-capacity per-frame buffer. Pick atomic-counter compaction or prefix-sum compaction and explain the tradeoff (atomics give nondeterministic order). Only the survivor count and the compacted boxes go D2H. The capacity limit and the overflow behaviour must be explicit and tested. Keep NMS on the host for this stage. Tests: same detection set as decode_yolox_output (order-insensitive compare), including the overflow case. Benchmark decode ms and D2H bytes per frame vs the NumPy path. Stretch: GPU NMS with an IoU bitmask.
+4. Re-run the experiments. Re-run the stream-count sweep and precision sweep with the new path. Report max sustainable stream count per tier and the per-stage breakdown, before vs after, with raw JSON. If a kernel bought little or nothing, say so and explain why. Update the charts.
+5. Stretch (only if I ask): port the fused preprocess kernel to Triton with the same tests. Compare performance and code complexity vs CUDA C, with one paragraph on when each is the right tool.
+6. README. Add a "Custom kernels" section: a plain-language explanation of each kernel, the roofline table, the before/after table, what didn't work, and limitations (single T4, YOLOX only, no attention or GEMM kernels).
